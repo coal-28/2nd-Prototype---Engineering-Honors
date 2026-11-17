@@ -1,0 +1,1456 @@
+#include "infotainment_ui.h"
+#include "lvgl.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// LVGL 8.x UI. Call infotainment_ui_create() after display/touch/LVGL initialization.
+// Coordinates are native 1024x600, matching the user's landscape graph-paper drawing.
+namespace {
+const uint32_t BG=0x15191B, PANEL=0x202528, EDGE=0x454B50, WHITE=0xF1F3F4;
+const uint32_t YELLOW=0xFFD536, RED=0xE64B48, BLUE=0x30B9F4, GREY=0x626A70;
+
+enum Page { NAV, RADIO, PHONE, MUSIC, TEMPERATURE };
+
+// Prototype 2 layout dimensions (1024 x 600)
+constexpr int SCREEN_W = 1024;
+constexpr int SCREEN_H = 600;
+constexpr int HUB_X = 150;
+constexpr int HUB_Y = 0;
+constexpr int HUB_W = 724;
+constexpr int HUB_H = 480;
+constexpr int HUB_NAV_H = 148;
+enum NavState { NAV_HOME, NAV_SEARCH, NAV_PRESETS, NAV_NEARBY, NAV_ROUTES, NAV_ACTIVE, NAV_ARRIVED };
+enum PhoneState { CONTACTS, CALLING, CONNECTED, KEYPAD };
+enum MusicState { LIBRARY, NOW_PLAYING };
+Page page=TEMPERATURE; NavState nav=NAV_HOME; PhoneState phone=CONTACTS; MusicState music=LIBRARY;
+lv_obj_t *root=nullptr,*content=nullptr,*sidebar=nullptr,*climate=nullptr,*vehicle=nullptr;
+lv_obj_t *page_btn[4]={},*vehicle_btn[6]={},*temp_label[2]={},*temp_marker[2]={};
+lv_obj_t *seat_bar[2][3]={},*fan_bar[7]={},*vol_label=nullptr,*radio_label=nullptr,*call_label=nullptr,*music_progress=nullptr;
+int temp[2]={68,72}, seat_mode[2]={0,0},seat_level[2]={0,0}, fan=3,volume=18;
+int radio_band=0, radio_idx[3]={0,0,0}, selected_song=0,call_seconds=0, call_wait_ms=0;
+bool vehicle_on[6]={},music_playing=false,call_muted=false;
+char destination[64]="1300 Academy Rd";
+const char *contacts[]={
+ "Bill","Bob","Joel","John","Will",
+ "Alex","Chris","Daniel","James","Michael"
+};
+
+const char *contact_numbers[]={
+ "5745550101","5745550102","5745550103",
+ "5745550104","5745550105","5745550106",
+ "5745550107","5745550108","5745550109",
+ "5745550110"
+};
+const char *songs[]={
+ "Soul Sister",
+ "2010s Hits",
+ "Hey Ya!",
+ "Counting Stars",
+ "Viva La Vida",
+ "Fireflies",
+ "Pompeii",
+ "Some Nights",
+ "Hall of Fame",
+ "Good Life"
+};
+
+const char *artists[]={
+ "Train",
+ "Apple Music",
+ "Outkast",
+ "OneRepublic",
+ "Coldplay",
+ "Owl City",
+ "Bastille",
+ "fun.",
+ "The Script",
+ "OneRepublic"
+};
+const int presets[3][4]={{1013,957,991,879},{990,1410,1250,720},{2,411,997,63}};
+const int radio_min[3]={875,530,1},radio_max[3]={1079,1710,999},radio_step[3]={2,10,1};
+int current_contact=0, music_elapsed=0;
+bool call_was_playing=false;
+bool manual_call=false;
+char active_phone_number[32]="";
+char phone_error[40]="";
+int phone_error_ms=0;
+lv_obj_t *music_slider=nullptr;
+lv_obj_t *music_time_label=nullptr;
+lv_obj_t *phone_number_label=nullptr;
+bool updating_music_slider=false;
+const int MUSIC_DURATION=210;
+int nav_previous=NAV_HOME, nearby_category=2, search_stage=0;
+bool end_confirmation=false;
+char dialed[32]="";
+uint32_t pseudo_random=0xA31F82u;
+int radio_hold_ms=0, radio_hold_direction=0;
+bool radio_hold_repeated=false;
+int call_target_ms=2000;
+lv_obj_t *volume_slider=nullptr,*temperature_slider[2]={};
+bool updating_shell=false;
+int climate_hold_type=0;
+int climate_hold_id=0;
+int climate_hold_ms=0;
+bool climate_hold_repeated=false;
+lv_obj_t *radio_minus=nullptr,*radio_plus=nullptr;
+lv_obj_t *radio_preset_btn[3]={};
+lv_obj_t *radio_permanent_label=nullptr;
+lv_obj_t *media_prev_btn=nullptr,*media_next_btn=nullptr,*media_toggle_btn=nullptr;
+lv_obj_t *home_temp_label[2]={};
+lv_obj_t *home_temp_slider[2]={};
+lv_obj_t *home_seat_bar[2][3]={};
+lv_obj_t *home_fan_bar[7]={};
+int media_mode=0; // 0 radio, 1 music
+void refresh_media();
+void media_action(lv_event_t *e);
+int radio_preset_page=0;
+bool radio_dial_open=false;
+char radio_digits[16]="";
+int radio_error_ms=0;
+lv_obj_t *radio_error_label=nullptr;
+const int radio_presets10[3][10]={
+ {1013,957,991,879,1035,925,1067,899,973,1051},
+ {990,1410,1250,720,530,670,810,1070,1510,1650},
+ {2,411,997,63,18,45,120,250,500,750}
+};
+
+lv_color_t color(uint32_t rgb){return lv_color_hex(rgb);}
+void paint(lv_obj_t *o,uint32_t bg=BG,uint32_t border=EDGE,int radius=3){
+ lv_obj_set_style_bg_color(o,color(bg),0);lv_obj_set_style_bg_opa(o,LV_OPA_COVER,0);
+ lv_obj_set_style_border_color(o,color(border),0);lv_obj_set_style_border_width(o,1,0);
+ lv_obj_set_style_radius(o,radius,0);lv_obj_set_style_pad_all(o,0,0);
+}
+lv_obj_t *box(lv_obj_t *parent,int x,int y,int w,int h,uint32_t bg=PANEL){
+ lv_obj_t *o=lv_obj_create(parent);lv_obj_set_pos(o,x,y);lv_obj_set_size(o,w,h);paint(o,bg);lv_obj_clear_flag(o,LV_OBJ_FLAG_SCROLLABLE);return o;
+}
+lv_obj_t *label(lv_obj_t *parent,const char *s,int x,int y,int w,int h,uint32_t fg=WHITE){
+ lv_obj_t *o=lv_label_create(parent);lv_label_set_text(o,s);lv_obj_set_pos(o,x,y);lv_obj_set_size(o,w,h);
+ lv_obj_set_style_text_color(o,color(fg),0);lv_obj_set_style_text_align(o,LV_TEXT_ALIGN_CENTER,0);
+ lv_obj_set_style_text_font(o, &lv_font_montserrat_14, 0);
+ lv_label_set_long_mode(o,LV_LABEL_LONG_CLIP);return o;
+}
+using CB=lv_event_cb_t;
+lv_obj_t *button(lv_obj_t *p,const char *s,int x,int y,int w,int h,CB cb,intptr_t id=0,uint32_t bg=PANEL){
+ lv_obj_t *b=lv_button_create(p);lv_obj_set_pos(b,x,y);lv_obj_set_size(b,w,h);paint(b,bg);
+ lv_obj_set_style_shadow_width(b,0,0);lv_obj_set_style_bg_color(b,color(YELLOW),LV_STATE_PRESSED);
+ if(cb)lv_obj_add_event_cb(b,cb,LV_EVENT_CLICKED,(void*)id);
+ lv_obj_t *l=lv_label_create(b);lv_label_set_text(l,s);lv_obj_center(l);lv_obj_set_style_text_color(l,color(bg==YELLOW?BG:WHITE),0);
+ return b;
+}
+// Vehicle symbols are LVGL line objects, so no icon files are required.
+// Each set of points uses local coordinates inside its button.
+enum VehicleSymbol { FRONT_DEF, REAR_DEF, HAZARD, RECIRC, ESC_OFF, MARKER };
+static const lv_point_precise_t windshield[]={{2,39},{5,25},{9,14},{16,9},{28,7},{40,9},{47,14},{51,25},{54,39},{2,39}};
+static const lv_point_precise_t rear_glass[]={
+    {9,6},{47,6},{47,44},{9,44},{9,6}
+};
+static const lv_point_precise_t steam1[]={{17,37},{14,30},{19,24},{16,18},{19,13}};
+static const lv_point_precise_t steam2[]={{28,37},{25,30},{30,24},{27,18},{30,13}};
+static const lv_point_precise_t steam3[]={{39,37},{36,30},{41,24},{38,18},{41,13}};
+static const lv_point_precise_t triangle[]={{28,4},{52,43},{4,43},{28,4}};
+static const lv_point_precise_t warning_stem[]={{28,16},{28,30}};
+static const lv_point_precise_t loop[]={{45,22},{45,13},{36,7},{22,7},{12,14},{9,26},{13,37},{24,44},{38,42}};
+static const lv_point_precise_t loop_tip[]={{32,35},{39,42},{46,34}};
+static const lv_point_precise_t car[]={{5,32},{11,21},{18,20},{24,13},{38,13},{45,21},{51,23},{53,34},{5,34},{5,32}};
+static const lv_point_precise_t skid[]={{11,43},{20,40},{29,44},{38,40},{47,43}};
+static const lv_point_precise_t slash[]={{8,48},{49,7}};
+static const lv_point_precise_t lamp_l[]={{21,18},{9,18},{9,35},{21,35},{21,18}};
+static const lv_point_precise_t lamp_r[]={{35,18},{47,18},{47,35},{35,35},{35,18}};
+static const lv_point_precise_t ray1[]={{2,16},{8,12}};
+static const lv_point_precise_t ray2[]={{2,26},{8,26}};
+static const lv_point_precise_t ray3[]={{2,36},{8,40}};
+static const lv_point_precise_t ray4[]={{48,12},{54,16}};
+static const lv_point_precise_t ray5[]={{48,26},{54,26}};
+static const lv_point_precise_t ray6[]={{48,40},{54,36}};
+void icon_line(lv_obj_t *parent,const lv_point_precise_t *points,uint16_t n,int x,int y,uint32_t ink=WHITE,int width=3){
+ lv_obj_t *line=lv_line_create(parent);
+ lv_line_set_points(line,points,n);lv_obj_set_pos(line,x,y);
+ lv_obj_set_style_line_color(line,color(ink),0);
+ lv_obj_set_style_line_width(line,width,0);
+ lv_obj_set_style_line_rounded(line,true,0);
+ lv_obj_clear_flag(line,LV_OBJ_FLAG_CLICKABLE);
+}
+void vehicle_icon(lv_obj_t *parent,int kind){
+ const int x=38,y=40;
+ if(kind==FRONT_DEF||kind==REAR_DEF){
+  if(kind==FRONT_DEF){ icon_line(parent,windshield,10,x,y); static const lv_point_precise_t bottom[]={{2,39},{54,39}}; icon_line(parent,bottom,2,x,y); } else icon_line(parent,rear_glass,5,x,y);
+  icon_line(parent,steam1,5,x,y);icon_line(parent,steam2,5,x,y);icon_line(parent,steam3,5,x,y);
+ }else if(kind==HAZARD){
+  icon_line(parent,triangle,4,x,y,RED,4);
+  icon_line(parent,warning_stem,2,x,y,RED,4);
+  box(parent,x+26,y+35,4,4,RED);
+ }else if(kind==RECIRC){
+  icon_line(parent,loop,9,x,y);icon_line(parent,loop_tip,3,x,y);
+ }else if(kind==ESC_OFF){
+  icon_line(parent,car,11,x,y);icon_line(parent,skid,5,x,y);
+  icon_line(parent,slash,2,x,y,RED,3);
+ }else if(kind==MARKER){
+  icon_line(parent,lamp_l,5,x,y);icon_line(parent,lamp_r,5,x,y);
+  icon_line(parent,ray1,2,x,y);icon_line(parent,ray2,2,x,y);
+  icon_line(parent,ray3,2,x,y);icon_line(parent,ray4,2,x,y);
+  icon_line(parent,ray5,2,x,y);icon_line(parent,ray6,2,x,y);
+ }
+}
+lv_obj_t *vehicle_indicator[6]={};
+
+void clear(lv_obj_t *o){lv_obj_clean(o);}
+void render_content();void refresh_shell();void temperature_draw();
+void navigate(NavState next){nav_previous=(int)nav;if(next==NAV_SEARCH)search_stage=0;nav=next;render_content();}
+void set_destination(const char *s){snprintf(destination,sizeof(destination),"%s",s);navigate(NAV_ROUTES);}
+void page_click(lv_event_t *e){
+ radio_hold_direction=0;
+ radio_hold_ms=0;
+
+ Page next=(Page)(intptr_t)lv_event_get_user_data(e);
+
+ // Switching to Radio pauses music.
+ if(next==RADIO){
+  media_mode=0;music_playing=false;
+ }else if(next==MUSIC){
+  media_mode=1;
+ }
+
+ page=next;
+
+ if(page==NAV){
+  nav=NAV_HOME;
+ }
+
+ render_content();
+   refresh_shell();
+  refresh_media();
+}
+void update_navigation_buttons(){
+ const char *names[]={"Navigation","Radio","Phone","Music"};
+ for(int i=0;i<4;i++){
+  if(!page_btn[i])continue;
+  bool active=(page==(Page)i);
+  lv_obj_t *t=lv_obj_get_child(page_btn[i],0);
+  lv_label_set_text(t,active?"Temperature":names[i]);
+  lv_obj_remove_event_cb(page_btn[i],page_click);
+  lv_obj_add_event_cb(page_btn[i],page_click,LV_EVENT_CLICKED,
+   (void*)(intptr_t)(active?TEMPERATURE:i));
+  lv_obj_set_style_bg_color(page_btn[i],color(PANEL),0);
+  lv_obj_set_style_text_color(t,color(WHITE),0);
+ }
+}
+void vehicle_click(lv_event_t *e){int n=(int)(intptr_t)lv_event_get_user_data(e);vehicle_on[n]=!vehicle_on[n];refresh_shell();}
+void temperature_click(lv_event_t *e){int n=(int)(intptr_t)lv_event_get_user_data(e);int side=n/2,delta=n%2?1:-1;temp[side]+=delta;if(temp[side]<59)temp[side]=59;if(temp[side]>86)temp[side]=86;refresh_shell();}
+void temperature_drag(lv_event_t *e){if(updating_shell)return;int side=(int)(intptr_t)lv_event_get_user_data(e);temp[side]=lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));refresh_shell();}
+void volume_drag(lv_event_t *e){if(updating_shell)return;volume=lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));refresh_shell();}
+void seat_click(lv_event_t *e){int n=(int)(intptr_t)lv_event_get_user_data(e),side=n/2,mode=n%2+1;
+ if(seat_mode[side]!=mode){seat_mode[side]=mode;seat_level[side]=1;}
+ else {seat_level[side]=(seat_level[side]+1)%4;if(!seat_level[side])seat_mode[side]=0;}
+ refresh_shell();}
+void fan_click(lv_event_t *e){fan+=(intptr_t)lv_event_get_user_data(e)?1:-1;if(fan<1)fan=1;if(fan>7)fan=7;refresh_shell();}
+void volume_click(lv_event_t *e){volume+=(intptr_t)lv_event_get_user_data(e)?1:-1;if(volume<0)volume=0;if(volume>40)volume=40;refresh_shell();}
+void climate_hold_event(lv_event_t *e){
+ lv_event_code_t event=lv_event_get_code(e);
+ int id=(int)(intptr_t)lv_event_get_user_data(e);
+ if(event==LV_EVENT_PRESSED){
+  climate_hold_type=id<4?1:(id<6?2:3);
+  climate_hold_id=id<4?id:(id<6?id-4:id-6);
+  climate_hold_ms=0;
+  climate_hold_repeated=false;
+ }else if(event==LV_EVENT_RELEASED||event==LV_EVENT_PRESS_LOST){
+  climate_hold_type=0;
+  climate_hold_ms=0;
+ }
+}
+
+static void slider_extended_touch(lv_event_t *e){
+ lv_event_code_t event=lv_event_get_code(e);
+ if(event!=LV_EVENT_PRESSED && event!=LV_EVENT_PRESSING) return;
+
+ lv_obj_t *slider=(lv_obj_t*)lv_event_get_user_data(e);
+ lv_indev_t *indev=lv_indev_active();
+ if(!indev || !slider) return;
+
+ lv_point_t point;
+ lv_indev_get_point(indev,&point);
+
+ lv_area_t area;
+ lv_obj_get_coords(slider,&area);
+
+ int width=area.x2-area.x1+1;
+ if(width<=1) return;
+
+ int minimum=lv_slider_get_min_value(slider);
+ int maximum=lv_slider_get_max_value(slider);
+
+ int position=point.x-area.x1;
+ if(position<0) position=0;
+ if(position>width-1) position=width-1;
+
+ int value=minimum+(position*(maximum-minimum)+(width-1)/2)/(width-1);
+
+ if(lv_slider_get_value(slider)!=value){
+  lv_slider_set_value(slider,value,LV_ANIM_OFF);
+  lv_obj_send_event(slider,LV_EVENT_VALUE_CHANGED,nullptr);
+ }
+}
+void radio_frequency_text(char *out,size_t size);
+void tune_step(int direction);
+void refresh_media(){
+ if(!radio_permanent_label)return;
+ if(media_mode==0){
+  char b[40];radio_frequency_text(b,sizeof(b));
+  lv_label_set_text(radio_permanent_label,b);
+ }else{
+  lv_label_set_text(radio_permanent_label,songs[selected_song]);
+ }
+ lv_label_set_text(lv_obj_get_child(media_toggle_btn,0),media_mode==0?"RADIO":"MUSIC");
+}
+void media_action(lv_event_t *e){
+ int a=(int)(intptr_t)lv_event_get_user_data(e);
+ if(a==2){
+  media_mode=1-media_mode;
+  if(media_mode==0)music_playing=false;
+ }else if(media_mode==0){
+  tune_step(a==1?1:-1);
+ }else{
+  selected_song=(selected_song+(a==1?1:9))%10;
+  music_elapsed=0;
+  if(page==MUSIC && music==NOW_PLAYING)render_content();
+ }
+ refresh_media();
+}
+void draw_climate(){
+ clear(climate);
+ // Permanent bottom bar: outside temperature | media | fan | volume | time.
+ // The driver and passenger temperature controls remain on Temperature home.
+ box(climate,0,0,148,112,BG);
+ label(climate,"OUTSIDE",6,12,136,24,YELLOW);
+ lv_obj_t *outside=label(climate,"72\xC2\xB0" "F",6,47,136,43);
+ lv_obj_set_style_text_font(outside,&lv_font_montserrat_28,0);
+
+ box(climate,150,0,244,112,BG);
+ label(climate,"RADIO / MUSIC",158,5,228,20);
+ media_prev_btn=button(climate,"<",157,36,40,49,media_action,0);
+ radio_permanent_label=label(climate,"",202,34,143,52,YELLOW);
+ media_next_btn=button(climate,">",347,36,40,49,media_action,1);
+ media_toggle_btn=button(climate,"RADIO",216,88,112,22,media_action,2);
+
+ box(climate,396,0,186,112,BG);
+ label(climate,"FAN",414,6,150,22,YELLOW);
+ lv_obj_t *fm=button(climate,"-",402,38,42,52,fan_click,0);
+ lv_obj_add_event_cb(fm,climate_hold_event,LV_EVENT_ALL,(void*)(intptr_t)6);
+ for(int i=0;i<7;i++)fan_bar[i]=box(climate,449+i*12,78-i*5,9,10+i*5,GREY);
+ lv_obj_t *fp=button(climate,"+",535,38,40,52,fan_click,1);
+ lv_obj_add_event_cb(fp,climate_hold_event,LV_EVENT_ALL,(void*)(intptr_t)7);
+
+ box(climate,584,0,288,112,BG);
+ label(climate,"VOLUME",635,5,185,23,YELLOW);
+ lv_obj_t *vm=button(climate,"-",592,36,39,51,volume_click,0);
+ lv_obj_add_event_cb(vm,climate_hold_event,LV_EVENT_ALL,(void*)(intptr_t)4);
+ volume_slider=lv_slider_create(climate);
+ lv_obj_set_pos(volume_slider,640,56);
+ lv_obj_set_size(volume_slider,148,16);
+ lv_slider_set_range(volume_slider,0,40);
+ lv_obj_set_style_bg_color(volume_slider,color(GREY),LV_PART_MAIN);
+ lv_obj_set_style_bg_color(volume_slider,color(YELLOW),LV_PART_INDICATOR);
+ lv_obj_set_style_bg_color(volume_slider,color(WHITE),LV_PART_KNOB);
+ lv_obj_add_event_cb(volume_slider,volume_drag,LV_EVENT_VALUE_CHANGED,nullptr);
+ vol_label=label(climate,"",790,46,34,29);
+ lv_obj_t *vp=button(climate,"+",828,36,39,51,volume_click,1);
+ lv_obj_add_event_cb(vp,climate_hold_event,LV_EVENT_ALL,(void*)(intptr_t)5);
+
+ box(climate,874,0,150,112,BG);
+ label(climate,"TIME",882,12,134,24,YELLOW);
+ lv_obj_t *clock=label(climate,"6:24 PM",879,49,140,40);
+ lv_obj_set_style_text_font(clock,&lv_font_montserrat_20,0);
+ // The clock and outside reading are demo placeholders, not live sensors.
+}
+void refresh_shell(){
+ updating_shell=true;
+ update_navigation_buttons();
+ for(int i=0;i<6;i++){
+  lv_obj_set_style_bg_color(vehicle_btn[i],color(PANEL),0);
+  lv_obj_set_style_bg_color(vehicle_indicator[i],color(vehicle_on[i]?YELLOW:GREY),0);
+ }
+ for(int s=0;s<2;s++){
+  char b[16];if(temp[s]==59)strcpy(b,"LO");else if(temp[s]==86)strcpy(b,"HI");else snprintf(b,sizeof(b),"%d\xC2\xB0",temp[s]);
+  if(temp_label[s])lv_label_set_text(temp_label[s],b);
+  if(temperature_slider[s])lv_slider_set_value(temperature_slider[s],temp[s],LV_ANIM_OFF);
+  for(int i=0;i<3;i++){
+   uint32_t c=i>=3-seat_level[s]?(seat_mode[s]==1?RED:BLUE):GREY;
+   if(seat_bar[s][i])lv_obj_set_style_bg_color(seat_bar[s][i],color(c),0);
+  }
+ }
+
+ for(int i=0;i<7;i++)if(fan_bar[i])lv_obj_set_style_bg_color(fan_bar[i],color(i<fan?YELLOW:GREY),0);
+ char b[12];snprintf(b,sizeof(b),"%d",volume);if(vol_label)lv_label_set_text(vol_label,b);if(volume_slider)lv_slider_set_value(volume_slider,volume,LV_ANIM_OFF);
+ if(page==TEMPERATURE){
+  for(int side=0;side<2;side++){
+   if(home_temp_label[side]){
+    char t[16];
+    if(temp[side]==59)strcpy(t,"LO");
+    else if(temp[side]==86)strcpy(t,"HI");
+    else snprintf(t,sizeof(t),"%d\xC2\xB0",temp[side]);
+    lv_label_set_text(home_temp_label[side],t);
+   }
+   if(home_temp_slider[side])lv_slider_set_value(home_temp_slider[side],temp[side],LV_ANIM_OFF);
+   for(int i=0;i<3;i++)if(home_seat_bar[side][i]){
+    uint32_t c=i>=3-seat_level[side]?(seat_mode[side]==1?RED:BLUE):GREY;
+    lv_obj_set_style_bg_color(home_seat_bar[side][i],color(c),0);
+   }
+  }
+  for(int i=0;i<7;i++)if(home_fan_bar[i])lv_obj_set_style_bg_color(home_fan_bar[i],color(i<fan?YELLOW:GREY),0);
+ }
+ updating_shell=false;
+}
+void nav_click(lv_event_t *e){
+ int action=(int)(intptr_t)lv_event_get_user_data(e);
+ if(action>=0&&action<=4){if(action>=2)nearby_category=action;navigate((NavState)(action==0?NAV_SEARCH:action==1?NAV_PRESETS:NAV_NEARBY));}
+ else if(action==5){NavState target=(NavState)nav_previous; if(nav==NAV_ROUTES && target==NAV_SEARCH)search_stage=0; if(target==nav)target=NAV_HOME; nav=target;nav_previous=NAV_HOME;end_confirmation=false;render_content();}
+ else if(action==6){set_destination("123 Sesame St");}
+ else if(action==7){navigate(NAV_ACTIVE);}
+ else if(action==8){end_confirmation=true;render_content();}
+ else if(action==9){nav=NAV_HOME;nav_previous=NAV_HOME;search_stage=0;end_confirmation=false;render_content();}
+ else if(action==10){end_confirmation=false;render_content();}
+ else if(action==11){search_stage=1;render_content();}
+}
+void preset_click(lv_event_t *e){int i=(int)(intptr_t)lv_event_get_user_data(e);set_destination(i==3?"1951 Crescent Ln":"1300 Academy Rd");}
+void nearby_click(lv_event_t *e){(void)e;set_destination("123 Sesame St");}
+void nav_draw(){
+ if(nav==NAV_HOME){
+  const char *opts[]={"Search","Presets","Food","Gas","Hotel"};
+  for(int i=0;i<5;i++)button(content,opts[i],10,7+i*66,158,60,nav_click,i,PANEL);
+  box(content,178,10,320,320,0x1A2B3C);
+  // Stylized map placeholder, not a live mapping service.
+  for(int i=0;i<5;i++)box(content,188+i*60,22,2,294,0x36536C);
+  for(int i=0;i<4;i++)box(content,188,54+i*81,300,2,0x36536C);
+  label(content,"N",307,110,60,30,YELLOW);
+  label(content,"ROUTE",290,165,95,90,YELLOW);
+  return;
+ }
+ if(nav!=NAV_ACTIVE && nav!=NAV_ARRIVED) button(content,"< Back",12,10,95,45,nav_click,5);
+ if(nav==NAV_SEARCH){label(content,"Search destination (demo)",115,32,380,42);
+  button(content,"Microphone / Simulate",145,135,280,75,nav_click,11);
+  label(content,search_stage?"Heard: 123 Sesame St":"Tap microphone to simulate",125,230,350,40);
+  if(search_stage)button(content,"Select destination",145,290,280,55,nav_click,6);
+ }
+ if(nav==NAV_PRESETS){const char *a[]={"Home","Work","Daycare","1951 Crescent..."};for(int i=0;i<4;i++)button(content,a[i],130,35+i*82,345,66,preset_click,i);}
+ if(nav==NAV_NEARBY){label(content,nearby_category==2?"Food results (demo)":nearby_category==3?"Gas results (demo)":"Hotel results (demo)",115,65,385,35);for(int i=0;i<3;i++){char b[32];snprintf(b,sizeof(b),"Result %d",i+1);button(content,b,135,110+i*80,340,65,nearby_click);}}
+ if(nav==NAV_ROUTES){label(content,destination,120,55,380,40,YELLOW);const char *a[]={"19 min  GO","22 min  GO","25 min  GO"};for(int i=0;i<3;i++)button(content,a[i],130,95+i*76,340,61,nav_click,7);}
+ if(nav==NAV_ACTIVE||nav==NAV_ARRIVED){box(content,130,65,355,190,0x1A2B3C);label(content,nav==NAV_ARRIVED?"ARRIVED":"ACTIVE NAVIGATION",150,90,315,50,YELLOW);label(content,"ETA / DISTANCE",160,190,300,40);button(content,"END",247,280,120,58,nav_click,8);
+  if(end_confirmation){box(content,90,95,400,220,0x292E32);label(content,"End navigation?",130,123,320,45,YELLOW);
+   button(content,"Cancel",112,223,165,60,nav_click,10);
+   button(content,"End",303,223,165,60,nav_click,9,RED);}
+ }
+}
+void radio_frequency_text(char *out,size_t size){
+ int v=radio_idx[radio_band];
+ if(v==0)v=radio_min[radio_band];
+ if(radio_band==0)
+  snprintf(out,size,"%d.%d MHz",v/10,v%10);
+ else if(radio_band==1)
+  snprintf(out,size,"%d kHz",v);
+ else
+  snprintf(out,size,"XM %d",v);
+}
+
+void radio_refresh(){
+ char b[40];
+ radio_frequency_text(b,sizeof(b));
+
+ if(radio_label)lv_label_set_text(radio_label,b);
+   if(radio_permanent_label && media_mode==0)lv_label_set_text(radio_permanent_label,b);
+
+ if(page!=RADIO || radio_dial_open)return;
+
+ for(int i=0;i<3;i++){
+  lv_obj_t *btn=radio_preset_btn[i];
+  if(!btn)continue;
+
+  int index=radio_preset_page*3+i;
+  if(index>=10)continue;
+
+  bool selected=radio_idx[radio_band]==radio_presets10[radio_band][index];
+
+  lv_obj_set_style_bg_color(
+   btn,color(selected?YELLOW:PANEL),0
+  );
+
+  lv_obj_t *txt=lv_obj_get_child(btn,0);
+  if(txt)lv_obj_set_style_text_color(
+   txt,color(selected?BG:WHITE),0
+  );
+ }
+}
+
+void tune_step(int direction){
+ int &v=radio_idx[radio_band];
+ if(v==0)v=radio_min[radio_band];
+
+ v+=direction*radio_step[radio_band];
+
+ if(v>radio_max[radio_band])v=radio_min[radio_band];
+ if(v<radio_min[radio_band])v=radio_max[radio_band];
+
+   radio_refresh();
+  refresh_media();
+}
+
+void tune_click(lv_event_t *e){
+ if(radio_hold_repeated)return;
+ int direction=(intptr_t)lv_event_get_user_data(e)?1:-1;
+ tune_step(direction);
+}
+
+void tune_press(lv_event_t *e){
+ lv_event_code_t c=lv_event_get_code(e);
+
+ if(c==LV_EVENT_PRESSED){
+  radio_hold_ms=0;
+  radio_hold_repeated=false;
+  radio_hold_direction=(intptr_t)lv_event_get_user_data(e)?1:-1;
+ }else if(c==LV_EVENT_RELEASED || c==LV_EVENT_PRESS_LOST){
+  radio_hold_direction=0;
+  radio_hold_ms=0;
+ }
+}
+
+void band_click(lv_event_t *e){
+ radio_band=(int)(intptr_t)lv_event_get_user_data(e);
+ if(radio_idx[radio_band]==0)
+  radio_idx[radio_band]=radio_min[radio_band];
+ radio_preset_page=0;
+ radio_dial_open=false;
+   render_content();
+  refresh_media();
+}
+
+void radio_preset(lv_event_t *e){
+ int index=(int)(intptr_t)lv_event_get_user_data(e);
+ if(index<0 || index>=10)return;
+
+ radio_idx[radio_band]=radio_presets10[radio_band][index];
+ render_content();
+   radio_refresh();
+  refresh_media();
+}
+
+void radio_page_click(lv_event_t *e){
+ int direction=(int)(intptr_t)lv_event_get_user_data(e);
+ radio_preset_page+=direction;
+
+ if(radio_preset_page<0)radio_preset_page=3;
+ if(radio_preset_page>3)radio_preset_page=0;
+
+ render_content();
+}
+
+void radio_dial_open_click(lv_event_t *){
+ radio_dial_open=true;
+ radio_digits[0]=0;
+ radio_error_ms=0;
+ render_content();
+}
+
+void radio_dial_back(lv_event_t *){
+ radio_dial_open=false;
+ radio_error_ms=0;
+ radio_digits[0]=0;
+ render_content();
+}
+
+void radio_dial_key(lv_event_t *e){
+ int key=(int)(intptr_t)lv_event_get_user_data(e);
+ size_t len=strlen(radio_digits);
+
+ if(key>=0 && key<=9){
+  if(len<sizeof(radio_digits)-1){
+   radio_digits[len]=(char)('0'+key);
+   radio_digits[len+1]=0;
+  }
+ }else if(key==10){
+  // Clear
+  radio_digits[0]=0;
+ }else if(key==11){
+  // Backspace
+  if(len>0)radio_digits[len-1]=0;
+ }else if(key==12){
+  // Enter
+  int entered=atoi(radio_digits);
+  int frequency=entered;
+
+  // FM: 1013 represents 101.3 MHz.
+  // Also accept 3 digits such as 995 for 99.5.
+  bool valid=strlen(radio_digits)>0;
+
+  if(radio_band==0){
+   valid=valid && strlen(radio_digits)>=3 &&
+         frequency>=radio_min[0] &&
+         frequency<=radio_max[0] &&
+         ((frequency-radio_min[0])%2==0);
+  }else if(radio_band==1){
+   valid=valid &&
+         frequency>=radio_min[1] &&
+         frequency<=radio_max[1] &&
+         ((frequency-radio_min[1])%10==0);
+  }else{
+   valid=valid &&
+         frequency>=radio_min[2] &&
+         frequency<=radio_max[2];
+  }
+
+  if(valid){
+   radio_idx[radio_band]=frequency;
+   radio_dial_open=false;
+   radio_error_ms=0;
+   render_content();
+      radio_refresh();
+   refresh_media();
+   return;
+  }
+
+  radio_error_ms=1000;
+ }
+
+ render_content();
+}
+
+void radio_dial_draw(){
+ label(content,"Radio Dial",15,8,210,30,YELLOW);
+
+ char current[40];
+ radio_frequency_text(current,sizeof(current));
+ label(content,current,245,8,350,30);
+
+ label(content,radio_digits,15,43,585,35,YELLOW);
+
+ const char *keys[]={
+  "1","2","3","4","5",
+  "6","7","8","9","0"
+ };
+
+ // Five columns, two rows
+ for(int i=0;i<10;i++){
+  int x=15+(i%5)*121;
+  int y=88+(i/5)*83;
+
+  button(content,keys[i],x,y,112,73,
+         radio_dial_key,(intptr_t)(keys[i][0]-'0'));
+ }
+
+ button(content,"< Back",15,265,105,55,radio_dial_back);
+ button(content,"DEL",130,265,100,55,radio_dial_key,11);
+ button(content,"CLR",240,265,100,55,radio_dial_key,10);
+ button(content,"ENTER",350,265,260,55,radio_dial_key,12,YELLOW);
+
+ radio_error_label=nullptr;
+
+ if(radio_error_ms>0){
+  radio_error_label=label(
+   content,"Invalid Frequency",160,292,320,30,RED
+  );
+ }
+}
+
+void radio_draw(){
+ radio_label=nullptr;
+ radio_error_label=nullptr;
+
+ for(int i=0;i<3;i++)radio_preset_btn[i]=nullptr;
+
+ if(radio_idx[radio_band]==0)
+  radio_idx[radio_band]=radio_min[radio_band];
+
+ if(radio_dial_open){
+  radio_dial_draw();
+  return;
+ }
+
+ const char *bands[]={"FM","AM","SiriusXM"};
+
+ for(int i=0;i<3;i++){
+  button(content,bands[i],
+         12+i*207,8,197,48,
+         band_click,i,
+         i==radio_band?YELLOW:PANEL);
+ }
+
+ char frequency[40];
+ radio_frequency_text(frequency,sizeof(frequency));
+
+ radio_minus=button(content,"<",15,82,85,75,tune_click,0);
+ lv_obj_add_event_cb(
+  radio_minus,tune_press,LV_EVENT_ALL,(void*)0
+ );
+
+ radio_label=label(
+  content,frequency,115,95,395,52,YELLOW
+ );
+ lv_obj_set_style_text_font(
+  radio_label,&lv_font_montserrat_28,0
+ );
+
+ radio_plus=button(content,">",525,82,85,75,tune_click,1);
+ lv_obj_add_event_cb(
+  radio_plus,tune_press,LV_EVENT_ALL,(void*)1
+ );
+
+ button(content,"DIAL",245,171,140,43,
+        radio_dial_open_click);
+
+ for(int i=0;i<3;i++){
+  int index=radio_preset_page*3+i;
+  if(index>=10)continue;
+
+  int v=radio_presets10[radio_band][index];
+
+  char text[32];
+  if(radio_band==0)
+   snprintf(text,sizeof(text),"%d.%d",v/10,v%10);
+  else
+   snprintf(text,sizeof(text),"%d",v);
+
+  bool selected=radio_idx[radio_band]==v;
+
+  radio_preset_btn[i]=button(
+   content,text,
+   15+i*207,230,197,65,
+   radio_preset,index,
+   selected?YELLOW:PANEL
+  );
+ }
+
+ button(content,"<",15,311,65,46,radio_page_click,-1);
+
+ char page_text[40];
+ snprintf(page_text,sizeof(page_text),
+          "Presets %d / 4",radio_preset_page+1);
+ label(content,page_text,210,317,210,35);
+
+ button(content,">",545,311,65,46,radio_page_click,1);
+}
+void music_refresh();
+
+void format_phone(const char *digits,char *out,size_t size){
+ size_t n=strlen(digits);
+
+ if(n==10){
+  snprintf(out,size,"(%.3s) %.3s-%.4s",
+           digits,digits+3,digits+6);
+ }else if(n==11 && digits[0]=='1'){
+  snprintf(out,size,"1 (%.3s) %.3s-%.4s",
+           digits+1,digits+4,digits+7);
+ }else if(n==7){
+  snprintf(out,size,"%.3s-%.4s",digits,digits+3);
+ }else{
+  snprintf(out,size,"%s",digits);
+ }
+}
+
+bool valid_phone_number(const char *digits){
+ size_t n=strlen(digits);
+
+ if(n==3){
+  return true;
+ }
+
+ if(n==7 || n==10){
+  return true;
+ }
+
+ if(n==11 && digits[0]=='1'){
+  return true;
+ }
+
+ return false;
+}
+
+void begin_call(){
+  call_was_playing=music_playing;
+ music_playing=false;
+
+ phone=CALLING;
+ call_wait_ms=0;
+ call_seconds=0;
+ call_muted=false;
+
+ pseudo_random=pseudo_random*1664525u+1013904223u;
+ call_target_ms=1500+(int)(pseudo_random%3501u);
+
+   render_content();
+  refresh_media();
+}
+
+void contact_click(lv_event_t *e){
+ current_contact=(int)(intptr_t)lv_event_get_user_data(e);
+
+ if(current_contact<0 || current_contact>=10)return;
+
+ manual_call=false;
+
+ snprintf(
+  active_phone_number,
+  sizeof(active_phone_number),
+  "%s",
+  contact_numbers[current_contact]
+ );
+
+ begin_call();
+}
+
+void phone_action(lv_event_t *e){
+ int action=(int)(intptr_t)lv_event_get_user_data(e);
+
+ if(action==0){
+  // End call and restore previous music state.
+  if(phone==CALLING || phone==CONNECTED){
+       music_playing=call_was_playing && media_mode==1;
+   call_was_playing=false;
+  }
+
+  phone=CONTACTS;
+  call_seconds=0;
+  manual_call=false;
+  dialed[0]=0;
+  phone_error_ms=0;
+ }
+ else if(action==1){
+  phone=KEYPAD;
+  dialed[0]=0;
+  phone_error_ms=0;
+ }
+ else if(action==2){
+  call_muted=!call_muted;
+ }
+ else if(action==3){
+  phone=CONTACTS;
+  dialed[0]=0;
+  phone_error_ms=0;
+ }
+
+   render_content();
+  refresh_media();
+}
+
+void phone_key(lv_event_t *e){
+ int key=(int)(intptr_t)lv_event_get_user_data(e);
+ size_t len=strlen(dialed);
+
+ if(key>=0 && key<=9){
+  if(len<11){
+   dialed[len]=(char)('0'+key);
+   dialed[len+1]=0;
+  }
+ }
+ else if(key==10){
+  // Clear entire number.
+  dialed[0]=0;
+ }
+ else if(key==11){
+  // Delete one digit.
+  if(len>0)dialed[len-1]=0;
+ }
+ else if(key==12){
+  // Enter and call.
+  if(valid_phone_number(dialed)){
+   manual_call=true;
+
+   snprintf(
+    active_phone_number,
+    sizeof(active_phone_number),
+    "%s",dialed
+   );
+
+   begin_call();
+   return;
+  }
+
+  snprintf(
+   phone_error,sizeof(phone_error),
+   "Enter Phone Number"
+  );
+
+  phone_error_ms=1000;
+ }
+
+ render_content();
+}
+
+void phone_draw(){
+ call_label=nullptr;
+ phone_number_label=nullptr;
+
+ if(phone==CONTACTS){
+  label(content,"Contacts",15,8,300,35,YELLOW);
+
+  button(
+   content,"DIAL",
+   500,8,120,42,
+   phone_action,1,YELLOW
+  );
+
+  lv_obj_t *list=lv_obj_create(content);
+
+  lv_obj_set_pos(list,12,58);
+  lv_obj_set_size(list,608,300);
+
+  paint(list,BG);
+  lv_obj_set_scroll_dir(list,LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(list,LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_style_pad_all(list,0,0);
+  lv_obj_set_scroll_dir(list,LV_DIR_VER);
+
+  for(int i=0;i<10;i++){
+   char formatted[40];
+   char text[100];
+
+   format_phone(
+    contact_numbers[i],
+    formatted,sizeof(formatted)
+   );
+
+   snprintf(
+    text,sizeof(text),
+    "%s    %s",
+    contacts[i],formatted
+   );
+
+   button(
+    list,text,
+    8,8+i*62,568,55,
+    contact_click,i
+   );
+  }
+
+  return;
+ }
+
+ if(phone==KEYPAD){
+  label(content,"Phone Dial",15,8,260,30,YELLOW);
+
+  char formatted[48];
+  format_phone(dialed,formatted,sizeof(formatted));
+
+  phone_number_label=label(
+   content,formatted,15,45,595,40,YELLOW
+  );
+
+  lv_obj_set_style_text_font(
+   phone_number_label,&lv_font_montserrat_20,0
+  );
+
+  const int keys[]={
+   1,2,3,4,5,6,7,8,9,10,0,11
+  };
+
+  const char *names[]={
+   "1","2","3","4","5","6",
+   "7","8","9","CLR","0","DEL"
+  };
+
+  for(int i=0;i<12;i++){
+   int x=15+(i%4)*152;
+   int y=100+(i/4)*69;
+
+   button(
+    content,names[i],
+    x,y,140,60,
+    phone_key,keys[i]
+   );
+  }
+
+  button(
+   content,"< Back",
+   15,291,140,44,
+   phone_action,3
+  );
+
+  button(
+   content,"ENTER",
+   315,291,295,44,
+   phone_key,12,YELLOW
+  );
+
+  if(phone_error_ms>0){
+   label(
+    content,phone_error,
+    165,293,140,40,RED
+   );
+  }
+
+  return;
+ }
+
+ char heading[100];
+
+ if(manual_call){
+  format_phone(
+   active_phone_number,
+   heading,sizeof(heading)
+  );
+ }else{
+  snprintf(
+   heading,sizeof(heading),
+   "%s",contacts[current_contact]
+  );
+ }
+
+ label(
+  content,heading,
+  65,45,500,55,YELLOW
+ );
+
+ label(
+  content,
+  phone==CALLING?"Calling...":"In Call",
+  135,120,360,45
+ );
+
+ if(phone==CONNECTED){
+  char time_text[32];
+
+  snprintf(
+   time_text,sizeof(time_text),
+   "%d:%02d",
+   call_seconds/60,
+   call_seconds%60
+  );
+
+  call_label=label(
+   content,time_text,
+   225,180,170,40
+  );
+
+  button(
+   content,
+   call_muted?"MUTE ON":"MUTE",
+   180,245,260,55,
+   phone_action,2
+  );
+ }
+
+ button(
+  content,"END",
+  200,285,220,48,
+  phone_action,0,RED
+ );
+}
+
+void music_refresh(){
+ if(music_slider){
+  updating_music_slider=true;
+  lv_slider_set_value(
+   music_slider,music_elapsed,LV_ANIM_OFF
+  );
+  updating_music_slider=false;
+ }
+
+ if(music_time_label){
+  char text[40];
+
+  snprintf(
+   text,sizeof(text),
+   "%d:%02d / 3:30",
+   music_elapsed/60,
+   music_elapsed%60
+  );
+
+  lv_label_set_text(music_time_label,text);
+ }
+}
+
+void music_seek(lv_event_t *e){
+ if(updating_music_slider)return;
+
+ music_elapsed=lv_slider_get_value(
+  (lv_obj_t*)lv_event_get_target(e)
+ );
+
+ music_refresh();
+}
+
+void music_click(lv_event_t *e){
+ selected_song=(int)(intptr_t)lv_event_get_user_data(e);
+
+ if(selected_song<0 || selected_song>=10)return;
+
+ music=NOW_PLAYING;
+ music_playing=true;
+ music_elapsed=0;
+
+   media_mode=1;
+  render_content();
+  refresh_media();
+}
+
+void music_action(lv_event_t *e){
+ int action=(int)(intptr_t)lv_event_get_user_data(e);
+
+ if(action==0){
+  music=LIBRARY;
+ }
+ else if(action==1){
+  music_playing=!music_playing;
+ }
+ else if(action==2){
+  selected_song=(selected_song+9)%10;
+  music_elapsed=0;
+ }
+ else if(action==3){
+  selected_song=(selected_song+1)%10;
+  music_elapsed=0;
+ }
+
+   render_content();
+  refresh_media();
+}
+
+void music_draw(){
+ music_slider=nullptr;
+ music_time_label=nullptr;
+ music_progress=nullptr;
+
+ if(music==LIBRARY){
+  label(content,"Music Library",15,8,590,35,YELLOW);
+
+  lv_obj_t *list=lv_obj_create(content);
+
+  lv_obj_set_pos(list,12,53);
+  lv_obj_set_size(list,608,305);
+
+  paint(list,BG);
+  lv_obj_set_scroll_dir(list,LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(list,LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_style_pad_all(list,0,0);
+  lv_obj_set_scroll_dir(list,LV_DIR_VER);
+
+  for(int i=0;i<10;i++){
+   char text[110];
+
+   snprintf(
+    text,sizeof(text),
+    "%s  -  %s",
+    songs[i],artists[i]
+   );
+
+   button(
+    list,text,
+    8,8+i*62,568,55,
+    music_click,i
+   );
+  }
+
+  return;
+ }
+
+ button(
+  content,"< Library",
+  15,8,130,45,
+  music_action,0
+ );
+
+ label(
+  content,songs[selected_song],
+  100,65,430,55,YELLOW
+ );
+
+ label(
+  content,artists[selected_song],
+  135,120,360,35
+ );
+
+ music_slider=lv_slider_create(content);
+
+ lv_obj_set_pos(music_slider,85,190);
+ lv_obj_set_size(music_slider,450,18);
+
+ lv_slider_set_range(
+  music_slider,0,MUSIC_DURATION
+ );
+
+ lv_obj_set_style_bg_color(
+  music_slider,color(GREY),LV_PART_MAIN
+ );
+
+ lv_obj_set_style_bg_color(
+  music_slider,color(YELLOW),LV_PART_INDICATOR
+ );
+
+ lv_obj_set_style_bg_color(
+  music_slider,color(WHITE),LV_PART_KNOB
+ );
+
+ lv_obj_add_event_cb(
+  music_slider,music_seek,
+  LV_EVENT_VALUE_CHANGED,nullptr
+ );
+
+ music_time_label=label(
+  content,"",215,220,200,30
+ );
+
+ button(
+  content,"PREV",
+  70,275,130,65,
+  music_action,2
+ );
+
+ button(
+  content,
+  music_playing?"PAUSE":"PLAY",
+  225,275,180,65,
+  music_action,1,YELLOW
+ );
+
+ button(
+  content,"NEXT",
+  430,275,130,65,
+  music_action,3
+ );
+
+ music_refresh();
+}
+void temperature_draw(){
+ // Four large screen selectors in the same positions as the paper sketch.
+ const char *names[]={"NAVIGATION","RADIO","MUSIC","PHONE"};
+ const int pages[]={NAV,RADIO,MUSIC,PHONE};
+ for(int i=0;i<4;i++){
+  int x=12+(i%2)*354;
+  int y=6+(i/2)*74;
+  lv_obj_t *b=button(content,names[i],x,y,344,68,page_click,pages[i]);
+  lv_obj_set_style_text_font(lv_obj_get_child(b,0),&lv_font_montserrat_20,0);
+ }
+ // Climate control area below the four screen selectors.
+ label(content,"FAN",321,193,82,28,YELLOW);
+ label(content,"DOWN",251,277,60,22);
+ label(content,"UP",415,277,60,22);
+ lv_obj_t *fm=button(content,"-",253,222,55,55,fan_click,0);
+ lv_obj_add_event_cb(fm,climate_hold_event,LV_EVENT_ALL,(void*)(intptr_t)6);
+ lv_obj_t *fp=button(content,"+",417,222,55,55,fan_click,1);
+ lv_obj_add_event_cb(fp,climate_hold_event,LV_EVENT_ALL,(void*)(intptr_t)7);
+ for(int i=0;i<7;i++)home_fan_bar[i]=box(content,314+i*14,258-i*5,10,15+i*5,GREY);
+ for(int side=0;side<2;side++){
+  int x=side?510:12;
+  // Temperature slider with adjacent +/- buttons.
+  lv_obj_t *minus=button(content,"-",x+5,222,43,53,temperature_click,side*2);
+  lv_obj_add_event_cb(minus,climate_hold_event,LV_EVENT_ALL,(void*)(intptr_t)(side*2));
+  lv_obj_t *plus=button(content,"+",x+153,222,43,53,temperature_click,side*2+1);
+  lv_obj_add_event_cb(plus,climate_hold_event,LV_EVENT_ALL,(void*)(intptr_t)(side*2+1));
+  home_temp_label[side]=label(content,"",x+52,225,97,38,YELLOW);
+  lv_obj_set_style_text_font(home_temp_label[side],&lv_font_montserrat_28,0);
+  home_temp_slider[side]=lv_slider_create(content);
+  lv_obj_set_pos(home_temp_slider[side],x+15,302);
+  lv_obj_set_size(home_temp_slider[side],170,15);
+  lv_slider_set_range(home_temp_slider[side],59,86);
+  lv_obj_set_style_bg_color(home_temp_slider[side],color(GREY),LV_PART_MAIN);
+  lv_obj_set_style_bg_color(home_temp_slider[side],color(RED),LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(home_temp_slider[side],color(WHITE),LV_PART_KNOB);
+  lv_obj_add_event_cb(home_temp_slider[side],temperature_drag,LV_EVENT_VALUE_CHANGED,(void*)(intptr_t)side);
+  // Separate heat/cool buttons and exactly three indicators per side.
+  button(content,"HEAT",x+4,354,94,40,seat_click,side*2);
+  button(content,"COOL",x+104,354,94,40,seat_click,side*2+1);
+  for(int j=0;j<3;j++)home_seat_bar[side][j]=box(content,x+43+j*41,407,29,15,GREY);
+ }
+}
+// Fit each screen's original design coordinates into the same available hub area.
+// Transform direct children only; scrollable list rows remain in their list's local space.
+void fit_hub_content(){
+ if(page==TEMPERATURE)return;
+ const int design_w=(page==NAV?510:640);
+ const int design_h=360;
+ const int available_w=HUB_W-16;
+ const int available_h=HUB_H-HUB_NAV_H-12;
+ int count=(int)lv_obj_get_child_count(content);
+ for(int i=0;i<count;i++){
+  lv_obj_t *obj=lv_obj_get_child(content,i);
+  int x=lv_obj_get_x(obj),y=lv_obj_get_y(obj);
+  int w=lv_obj_get_width(obj),h=lv_obj_get_height(obj);
+  lv_obj_set_pos(obj,8+x*available_w/design_w,6+y*available_h/design_h);
+  lv_obj_set_size(obj,w*available_w/design_w,h*available_h/design_h);
+  if((page==PHONE && phone==CONTACTS) || (page==MUSIC && music==LIBRARY)){
+   if(lv_obj_get_child_count(obj)>=10){
+    int rows=(int)lv_obj_get_child_count(obj);
+    for(int j=0;j<rows;j++){
+     lv_obj_t *row=lv_obj_get_child(obj,j);
+     lv_obj_set_width(row,lv_obj_get_width(obj)-20);
+    }
+   }
+  }
+ }
+}
+
+void render_content(){
+ if(page==TEMPERATURE){
+  lv_obj_add_flag(sidebar,LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_pos(content,HUB_X,HUB_Y);
+  lv_obj_set_size(content,HUB_W,HUB_H);
+ }else{
+  lv_obj_clear_flag(sidebar,LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_pos(content,HUB_X,HUB_Y+HUB_NAV_H);
+  lv_obj_set_size(content,HUB_W,HUB_H-HUB_NAV_H);
+ }
+ radio_hold_direction=0;
+ for(int i=0;i<2;i++){
+  home_temp_label[i]=nullptr;home_temp_slider[i]=nullptr;
+  for(int j=0;j<3;j++)home_seat_bar[i][j]=nullptr;
+ }
+ for(int i=0;i<7;i++)home_fan_bar[i]=nullptr;
+ call_label=nullptr;music_progress=nullptr;music_slider=nullptr;
+ music_time_label=nullptr;phone_number_label=nullptr;
+ radio_minus=nullptr;radio_plus=nullptr;radio_label=nullptr;radio_error_label=nullptr;
+ for(int i=0;i<3;i++)radio_preset_btn[i]=nullptr;
+ clear(content);
+ if(page==NAV)nav_draw();
+ else if(page==RADIO)radio_draw();
+ else if(page==PHONE)phone_draw();
+ else if(page==MUSIC)music_draw();
+ else temperature_draw();
+ fit_hub_content();
+ update_navigation_buttons();
+ refresh_shell();
+}
+void tick(lv_timer_t *){
+ static int elapsed_ms=0;
+ if(climate_hold_type!=0){
+  climate_hold_ms+=50;
+  int delay=400;
+  int interval=climate_hold_type==1?150:(climate_hold_type==2?100:250);
+  if(climate_hold_ms>=delay && (climate_hold_ms-delay)%interval==0){
+   climate_hold_repeated=true;
+   int direction=(climate_hold_id%2)?1:-1;
+   if(climate_hold_type==3){fan+=direction;if(fan<1)fan=1;if(fan>7)fan=7;}else if(climate_hold_type==1){
+    int side=climate_hold_id/2;
+    temp[side]+=direction;
+    if(temp[side]<59)temp[side]=59;
+    if(temp[side]>86)temp[side]=86;
+   }else{
+    volume+=direction;
+    if(volume<0)volume=0;
+    if(volume>40)volume=40;
+   }
+   refresh_shell();
+  }
+ }
+ if(page==RADIO&&radio_hold_direction!=0){
+  radio_hold_ms+=50;
+  if(radio_hold_ms>=400 && (radio_hold_ms-400)%100==0){
+   radio_hold_repeated=true;tune_step(radio_hold_direction);
+  }
+ }
+ if(radio_error_ms>0){
+ radio_error_ms-=50;
+ if(radio_error_ms<=0){
+  radio_error_ms=0;
+  if(page==RADIO && radio_dial_open)render_content();
+ }
+}
+if(phone_error_ms>0){
+ phone_error_ms-=50;
+
+ if(phone_error_ms<=0){
+  phone_error_ms=0;
+
+  if(page==PHONE && phone==KEYPAD){
+   render_content();
+  }
+ }
+}
+
+if(phone==CALLING){call_wait_ms+=50;if(call_wait_ms>=call_target_ms){phone=CONNECTED;if(page==PHONE)render_content();}}
+ elapsed_ms+=50;if(elapsed_ms<1000)return;elapsed_ms=0;
+ if(phone==CONNECTED){call_seconds++;if(page==PHONE&&call_label){char b[24];snprintf(b,sizeof(b),"%d:%02d",call_seconds/60,call_seconds%60);lv_label_set_text(call_label,b);}}
+ if(music_playing){
+ music_elapsed++;
+
+ if(music_elapsed>=MUSIC_DURATION){
+  music_elapsed=0;
+     selected_song=(selected_song+1)%10;
+   refresh_media();
+
+  if(page==MUSIC && music==NOW_PLAYING){
+   render_content();
+  }
+ }
+
+ if(page==MUSIC && music==NOW_PLAYING){
+  music_refresh();
+ }
+}
+}
+} // namespace
+extern "C" void infotainment_ui_create(void){
+ root=lv_screen_active();lv_obj_set_style_bg_color(root,color(BG),0);lv_obj_clear_flag(root,LV_OBJ_FLAG_SCROLLABLE);
+ lv_obj_set_size(root,1024,600);clear(root);
+
+ // Central hub between permanent vehicle controls; bottom climate/status bar.
+ content=box(root,HUB_X,HUB_Y+HUB_NAV_H,HUB_W,HUB_H-HUB_NAV_H,BG);
+ sidebar=box(root,HUB_X,HUB_Y,HUB_W,HUB_NAV_H,BG);
+ const char *pages[]={"NAV","RADIO","PHONE","MUSIC"};
+ // Visual order top-to-bottom from the user's rotated drawing: Music, Phone, Radio, Navigation.
+ const int page_order[]={NAV,RADIO,MUSIC,PHONE};
+for(int i=0;i<4;i++){
+ int p=page_order[i];
+ page_btn[p]=button(sidebar,pages[p],12+(i%2)*354,6+(i/2)*74,344,68,page_click,p);
+ lv_obj_set_style_text_font(
+  lv_obj_get_child(page_btn[p],0),
+  &lv_font_montserrat_20,0
+ );
+}
+ vehicle=root;
+ for(int i=0;i<6;i++){
+  int vx=(i<3)?8:884;
+int vy=7+(i%3)*156;
+vehicle_btn[i]=button(vehicle,"",vx,vy,132,148,vehicle_click,i);
+  vehicle_indicator[i]=box(vehicle_btn[i],18,7,96,5,GREY);
+  vehicle_icon(vehicle_btn[i],i==3?ESC_OFF:(i==4?MARKER:(i==5?RECIRC:i)));
+ }
+ climate=box(root,0,485,1024,115,BG);
+   draw_climate();
+  radio_idx[0]=radio_min[0];radio_idx[1]=radio_min[1];radio_idx[2]=radio_min[2];
+  render_content();
+   refresh_shell();
+  refresh_media();
+  lv_timer_create(tick,50,nullptr);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
