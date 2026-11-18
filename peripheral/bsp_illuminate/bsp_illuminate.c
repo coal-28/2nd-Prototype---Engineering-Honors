@@ -260,6 +260,7 @@ static esp_err_t lvgl_init(void)
         ILLUMINATE_ERROR("LVGL dsi port add fail");
     }
 
+
     /* Register the GT911 touch as the LVGL pointer input device. */
     const lvgl_port_touch_cfg_t touch_cfg = {
         .disp = my_lvgl_disp,
